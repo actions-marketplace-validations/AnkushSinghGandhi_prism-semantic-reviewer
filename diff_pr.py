@@ -28,20 +28,20 @@ import deps as deps_mod                        # noqa: E402
 
 CRIT, HIGH, MED, LOW = "🔴", "🟠", "🟡", "🟢"
 EDGES = [("e3_db_tables", "db"), ("e4_external", "external"),
-         ("e5_async", "async"), ("e6_pii", "pii")]
+         ("e5_async", "async"), ("e6_pii", "pii"), ("e7_cache", "cache")]
 
-INFO_URI = "https://github.com/AnkushSinghGandhi/prism"
-# GitHub code-scanning alert level per Prism severity tier.
+INFO_URI = "https://github.com/AnkushSinghGandhi/lenscheck-semantic-reviewer"
+# GitHub code-scanning alert level per Lenscheck severity tier.
 SARIF_LEVEL = {CRIT: "error", HIGH: "error", MED: "warning", LOW: "note"}
 # Optional numeric on each result for the Security-tab Critical/High/Medium/Low sort.
 SARIF_SECURITY = {CRIT: "9.0", HIGH: "7.0", MED: "4.0", LOW: "2.0"}
 
 
-def _prism_version():
+def _lenscheck_version():
     try:
         from importlib.metadata import version, PackageNotFoundError
         try:
-            return version("prism-semantic-reviewer")
+            return version("lenscheck-semantic-reviewer")
         except PackageNotFoundError:
             pass
     except Exception:
@@ -87,6 +87,8 @@ def _resources(ep):
         res.add("ext:" + x.split(" -> ", 1)[-1])
     for a in items(ep, "e5_async"):
         res.add("async:" + a)
+    for c in items(ep, "e7_cache"):
+        res.add("cache:" + c.split(" ", 2)[-1])   # shared cache key → related endpoints
     return res
 
 
@@ -106,6 +108,55 @@ def blast_radius(ep, idx):
         reached |= idx.get(r, set())
     reached.discard(ep.route)
     return len(reached)
+
+
+def shared_external_destinations(eps, min_routes=2):
+    """External destinations reached by several endpoints — the egress fan-in, most-shared first.
+    Collapses the 'N endpoints funnel through the same destination' case (usually one shared helper)
+    into a single group, so a reviewer verifies a destination once instead of once per route. Each
+    group is `(dest, [routes])`."""
+    idx = fanin_index(eps)
+    groups = [(res[len("ext:"):], sorted(routes))
+              for res, routes in idx.items()
+              if res.startswith("ext:") and len(routes) >= min_routes]
+    groups.sort(key=lambda g: (-len(g[1]), g[0]))
+    return groups
+
+
+def _egress_status(dest):
+    """How pinned-down a shared destination is: a {placeholder} host is 'partial', a bare '?' is
+    'unresolved', anything else is 'ok' (a full literal). Same honesty as the E4 edge status."""
+    if "{" in dest:
+        return "partial"
+    if dest.strip() == "?":
+        return "unresolved"
+    return "ok"
+
+
+def egress_payload(groups, only_routes=None):
+    """Structured shared-egress groups for the JSON/web outputs: one entry per destination reached
+    by ≥2 endpoints, `{dest, routes, count, status}`. `only_routes` keeps just the groups the change
+    participates in (PR view); None keeps all (full-repo view)."""
+    return [{"dest": dest, "routes": routes, "count": len(routes), "status": _egress_status(dest)}
+            for dest, routes in groups
+            if only_routes is None or (set(routes) & only_routes)]
+
+
+def render_egress_section(groups, only_routes=None, cap=8):
+    """Markdown for the shared-egress groups. `only_routes` keeps just groups touching those routes
+    (so a PR report shows only egress the change participates in); None shows all (full-repo view)."""
+    rows = egress_payload(groups, only_routes)
+    if not rows:
+        return ""
+    flag = {"partial": " · ⚠ partial", "unresolved": " · ? unresolved", "ok": ""}
+    L = ["### 🌐 Shared egress (fan-in)\n",
+         "_Endpoints funnelling through the same outbound call — verify the destination once, "
+         "not once per route._\n"]
+    for g in rows[:cap]:
+        routes = g["routes"]
+        L.append(f"- **{g['count']} endpoints → `{g['dest']}`**{flag[g['status']]}")
+        L.append("    " + ", ".join(f"`{r}`" for r in routes[:12]) + (" …" if len(routes) > 12 else ""))
+    return "\n".join(L)
 
 
 def parse_changed_lines(diff_text):
@@ -146,13 +197,13 @@ def dependency_findings(repo, base, head):
     """Capability-delta findings for any dependency manifest changed in `base..head` (feature #5).
 
     Manifest bump detection is always on (cheap, offline); the capability scan fetches each version
-    from PyPI unless `PRISM_SCAN_DEPS=0`, degrading to ⚠ unresolved when offline — never assuming
+    from PyPI unless `LENSCHECK_SCAN_DEPS=0`, degrading to ⚠ unresolved when offline — never assuming
     safe. Returns [] when no manifest changed."""
     names = [p for p in sh("git", "-C", repo, "diff", "--name-only", base, head).splitlines()
              if deps_mod.is_manifest(p)]
     if not names:
         return []
-    provider = None if os.environ.get("PRISM_SCAN_DEPS") == "0" else deps_mod.pypi_source_provider
+    provider = None if os.environ.get("LENSCHECK_SCAN_DEPS") == "0" else deps_mod.pypi_source_provider
     findings = []
     for path in names:
         old_map = deps_mod.parse_manifest(path, sh("git", "-C", repo, "show", f"{base}:{path}"))
@@ -162,17 +213,23 @@ def dependency_findings(repo, base, head):
     return findings
 
 
+def _open_item(x):
+    return "AllowAny" in x or x.startswith("permission_classes=[]")   # AllowAny or no permission classes
+
+
 def auth_str(ep):
     e = ep.e2_auth
     if e.status == "?":
         return "unspecified"
     if any("AllowAny" in x for x in e.items):
         return "open (AllowAny)"
+    if any(x.startswith("permission_classes=[]") for x in e.items):
+        return "open (no permission classes)"
     return " ".join(e.items) or "unspecified"
 
 
 def is_open(ep):
-    return ep.e2_auth.status == "?" or any("AllowAny" in x for x in ep.e2_auth.items)
+    return ep.e2_auth.status == "?" or any(_open_item(x) for x in ep.e2_auth.items)
 
 
 def index(eps):
@@ -190,6 +247,9 @@ def flow(ep):
     ext = sorted(items(ep, "e4_external"))
     if ext:
         parts.append("ext: " + ", ".join(ext))
+    ca = sorted(items(ep, "e7_cache"))
+    if ca:
+        parts.append("cache: " + ", ".join(ca))
     return " → ".join(parts)
 
 
@@ -201,6 +261,16 @@ def unknowns(ep):
             vals = ", ".join(sorted({norm(x) for x in e.items}))   # identities; locs are in investigate
             out.append(f"{label} {e.status}: {vals}" + (f" — {e.note}" if e.note else ""))
     return out
+
+
+def ops_of(ep):
+    """What an endpoint touches — booleans over the lens facts, for the web list filters."""
+    kinds = {x.split(":", 1)[1] for x in items(ep, "e3_db_tables") if ":" in x}   # {"read","write"}
+    return {"read": any(k.startswith("read") for k in kinds),
+            "write": any(k.startswith("write") for k in kinds),
+            "external": bool(items(ep, "e4_external")),
+            "async": bool(items(ep, "e5_async")),
+            "cache": bool(items(ep, "e7_cache"))}
 
 
 def diff(base_eps, head_eps):
@@ -263,6 +333,10 @@ def diff(base_eps, head_eps):
                 writes = [t for t in new if ":write" in t]
                 sub.append((MED if not (writes and is_open(h)) else CRIT,
                             f"new DB {'write' if writes else 'access'}: {', '.join(sorted(new))}"))
+            elif label == "cache":
+                invalidates = any(t.startswith("write") for t in new)
+                sub.append((LOW, f"new cache {'invalidation/write' if invalidates else 'read'}: "
+                                 f"{', '.join(sorted(new))}"))
             else:
                 sub.append((MED, f"new async dispatch: {', '.join(sorted(new))}"))
         if sub:
@@ -347,7 +421,7 @@ def intent_summary(changes, findings):
 
 
 # ---- Intent vs. behavior (feature #4) -------------------------------------------------------
-# The PR title/description is a *declared* intent — a contract the author wrote. Prism already
+# The PR title/description is a *declared* intent — a contract the author wrote. Lenscheck already
 # knows what the code does. Cross-check the two and flag disagreements. Competitors fake this by
 # asking an LLM to eyeball the diff; every contradiction below is derived from a verified fact
 # that traces to a `file:line`, so it can't be hallucinated. (#3 is the neutral summary; #4 is
@@ -408,7 +482,7 @@ def _where(route, loc):
 
 
 def intent_contradictions(title, changes, findings=None, body=""):
-    """Flag where the PR's declared intent (title/description) disagrees with Prism's own facts.
+    """Flag where the PR's declared intent (title/description) disagrees with Lenscheck's own facts.
     Returns finding dicts (`sev`/`claim`/`why`/`route`/`loc`) — a finding type competitors fake
     with an LLM, produced here from structured facts. Empty when no claim is declared, or the
     facts are consistent with it."""
@@ -447,7 +521,7 @@ def render_intent_section(contradictions):
          f"{_plural(len(contradictions), 'contradiction')}:\n"]
     for c in contradictions:
         L.append(f"- {c['sev']} {c['why']}")
-    L.append("\n_Declared intent = the PR title/description; each line is derived from Prism's own "
+    L.append("\n_Declared intent = the PR title/description; each line is derived from Lenscheck's own "
              "facts (traceable to `file:line`), not an LLM reading the diff._\n")
     return "\n".join(L)
 
@@ -501,6 +575,8 @@ def render(changes, meta):
         L.append(meta["deps_section"])
     if meta.get("inv_section"):
         L.append(meta["inv_section"])
+    if meta.get("egress_section"):
+        L.append(meta["egress_section"])
     buckets = {CRIT: [], HIGH: [], MED: [], LOW: []}
     for c in changes:
         buckets[c["sev"]].append(c)
@@ -534,8 +610,9 @@ def render(changes, meta):
             L.append(f"- **unknown:** " + " · ".join(uk))
         L.append("")
     L.append("---")
-    L.append("_Blindspot: this diff sees routing/auth/db/external/async at the endpoint lens; "
-             "it does not see logic inside a function, ordering, concurrency, or off-by-one._")
+    L.append("_Blindspot: this diff sees routing, auth, db tables (+ their SQL table), external "
+             "calls, async, cache, and PII at the endpoint lens; it does not see logic inside a "
+             "function, ordering, concurrency, or off-by-one._")
     return "\n".join(L)
 
 
@@ -562,6 +639,8 @@ def build_graph(ep):
             if ntype == "table":
                 label, _, k = clean.partition(":")
                 kind = k
+            elif ntype == "cache":
+                kind, _, label = clean.partition(" ")   # "write set user:{pk}" → kind=write, label="set user:{pk}"
             else:
                 label = clean.split(" -> ", 1)[-1]
                 kind = kind_of
@@ -572,6 +651,15 @@ def build_graph(ep):
     leaf(ep.e3_db_tables.items, "table", "")
     leaf(ep.e4_external.items, "external", "calls")
     leaf(ep.e5_async.items, "async", "dispatches")
+    leaf(ep.e7_cache.items, "cache", "")
+    # hang the real SQL table off each model node — Model → db table
+    for model, info in (getattr(ep, "tables", {}) or {}).items():
+        mnid = f"table:{model}"
+        if mnid in ids:
+            tnid = f"dbtable:{info['table']}"
+            add(tnid, info["table"], "dbtable", explicit=info.get("explicit", True))
+            edges.append({"from": mnid, "to": tnid,
+                          "kind": "table" if info.get("explicit", True) else "table (convention)"})
     return {"nodes": nodes, "edges": edges}
 
 
@@ -619,12 +707,12 @@ def build_review(changes, findings, meta, changed=None):
             graph = _state_all(build_graph(ep), "added")   # NEW ENDPOINT → all new
         return {"sev": c["sev"], "kind": c["kind"], "route": c["route"], "why": c["why"],
                 "detail": c.get("detail", ""), "auth": auth_str(ep), "flow": flow(ep),
-                "blast": c.get("blast", 0),
+                "blast": c.get("blast", 0), "ops": ops_of(ep),
                 "investigate": investigate, "unknowns": unknowns(ep), "graph": graph}
     return {"title": meta["title"], "base": meta["base"], "head": meta["head"],
             "shortstat": meta["shortstat"], "summary": meta.get("summary", ""),
             "invariants": findings or [], "contradictions": meta.get("contradictions", []),
-            "dependencies": meta.get("dependencies", []),
+            "dependencies": meta.get("dependencies", []), "egress": meta.get("egress", []),
             "changed_lines": changed or {}, "changes": [cd(c) for c in changes]}
 
 
@@ -677,7 +765,7 @@ def build_sarif(review):
             seen.add(rid)
             rules.append({"id": rid, "name": rid.split("/")[-1],
                           "shortDescription": {"text": desc},
-                          "properties": {"tags": ["prism"]}})
+                          "properties": {"tags": ["lenscheck"]}})
 
     def emit(rid, sev, text, path, line, in_diff, fp):
         loc = []
@@ -689,14 +777,14 @@ def build_sarif(review):
         results.append({
             "ruleId": rid, "level": SARIF_LEVEL.get(sev, "warning"),
             "message": {"text": text}, "locations": loc,
-            "partialFingerprints": {"prism/v1": fp},
-            "properties": {"prism-severity": sev, "in-diff": in_diff,
+            "partialFingerprints": {"lenscheck/v1": fp},
+            "properties": {"lenscheck-severity": sev, "in-diff": in_diff,
                            "security-severity": SARIF_SECURITY.get(sev, "4.0")},
         })
 
     for c in review.get("changes", []):
-        rid = "prism/" + c["kind"].lower().replace(" ", "-")
-        rule(rid, f"Prism semantic change: {c['kind']}")
+        rid = "lenscheck/" + c["kind"].lower().replace(" ", "-")
+        rule(rid, f"Lenscheck semantic change: {c['kind']}")
         path, line, in_diff = _best_location(c, changed)
         text = f"{c['kind']} {c['route']} — {c.get('why', '')}".strip()
         emit(rid, c.get("sev", MED), text, path, line, in_diff, f"{c['kind']}::{c['route']}")
@@ -704,8 +792,8 @@ def build_sarif(review):
     for f in review.get("invariants", []):
         if f["kind"] not in ("NEW VIOLATION", "WEAKENING", "STILL-VIOLATING", "STILL-OUT"):
             continue                            # only real alerts; HELD/RESOLVED aren't findings
-        rid = "prism/invariant/" + f["kind"].lower().replace(" ", "-")
-        rule(rid, f"Prism invariant alert: {f['kind']}")
+        rid = "lenscheck/invariant/" + f["kind"].lower().replace(" ", "-")
+        rule(rid, f"Lenscheck invariant alert: {f['kind']}")
         sev, stmt = f.get("sev", MED), f.get("stmt", "")
         located = []
         for loc in f.get("locs", []):
@@ -722,8 +810,8 @@ def build_sarif(review):
                  f"{f['kind']}::{stmt}")
 
     for c in review.get("contradictions", []):  # intent-vs-behavior (feature #4)
-        rid = "prism/intent-contradiction"
-        rule(rid, "Prism intent-vs-behavior contradiction")
+        rid = "lenscheck/intent-contradiction"
+        rule(rid, "Lenscheck intent-vs-behavior contradiction")
         p, ln = _split_where(c.get("loc", ""))
         in_diff = bool(p and ln is not None and ln in changed.get(p, ()))
         emit(rid, c.get("sev", HIGH), c.get("why", "intent contradiction"),
@@ -732,8 +820,8 @@ def build_sarif(review):
     for d in review.get("dependencies", []):    # dependency capability-delta (feature #5)
         if not (d.get("gained") or d.get("unresolved")):
             continue                            # a bump with no new capabilities isn't an alert
-        rid = "prism/dependency-capability"
-        rule(rid, "Prism dependency capability change")
+        rid = "lenscheck/dependency-capability"
+        rule(rid, "Lenscheck dependency capability change")
         path = d.get("manifest")
         text = f"{d['name']} {d.get('old') or '(new)'}→{d['new']} — {d.get('why', '')}"
         emit(rid, d.get("sev", MED), text, path, None, False,
@@ -743,8 +831,8 @@ def build_sarif(review):
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": "Prism", "informationUri": INFO_URI,
-                                "version": _prism_version(), "rules": rules}},
+            "tool": {"driver": {"name": "Lenscheck", "informationUri": INFO_URI,
+                                "version": _lenscheck_version(), "rules": rules}},
             "results": results,
         }],
     }
@@ -765,7 +853,7 @@ def _gh_owner_repo(url):
 
 def _github_json(api):
     req = urllib.request.Request(api, headers={"Accept": "application/vnd.github+json",
-                                               "User-Agent": "prism"})
+                                               "User-Agent": "lenscheck"})
     tok = os.environ.get("GITHUB_TOKEN")
     if tok:
         req.add_header("Authorization", f"Bearer {tok}")
@@ -779,7 +867,7 @@ def _is_github_url(repo):
 def resolve_github_pr(url, local, n):
     """Look up a real GitHub PR: return (base_sha, head_sha, title). Fetches the PR head ref."""
     if not _is_github_url(url):
-        raise RuntimeError("--pr requires a GitHub repo URL so Prism can look up the PR metadata")
+        raise RuntimeError("--pr requires a GitHub repo URL so Lenscheck can look up the PR metadata")
     owner, repo = _gh_owner_repo(url)
     api = f"https://api.github.com/repos/{owner}/{repo}/pulls/{n}"
     data = _github_json(api)
@@ -797,8 +885,8 @@ def resolve_github_pr(url, local, n):
         raise RuntimeError(f"could not fetch GitHub PR {n} {label}: {last}")
 
     # Fetch only the commits needed for this PR into local refs so git archive can find them.
-    fetch_ref("base", "refs/prism/base", base_sha, data["base"]["ref"])
-    fetch_ref("head", "refs/prism/head", f"pull/{n}/head", head_sha)
+    fetch_ref("base", "refs/lenscheck/base", base_sha, data["base"]["ref"])
+    fetch_ref("head", "refs/lenscheck/head", f"pull/{n}/head", head_sha)
     return base_sha, head_sha, f"PR #{n}: {data.get('title', '')}", data.get("body") or ""
 
 
@@ -923,9 +1011,13 @@ def run_review(repo, base=None, head=None, merge=None, pr=None, commit=None, inv
     changed = changed_lines(repo, b, h)              # head-side lines a PR comment can anchor to
     contradictions = intent_contradictions(title, changes, findings, body=body)
     deps_findings = dependency_findings(repo, b, h)
+    egress_groups = shared_external_destinations(head_eps)
+    changed_routes = {c["route"] for c in changes}
     meta = dict(title=title, base=b, head=h, shortstat=shortstat, inv_section=inv_section,
                 intent_section=render_intent_section(contradictions), contradictions=contradictions,
                 deps_section=deps_mod.render_deps_section(deps_findings), dependencies=deps_findings,
+                egress_section=render_egress_section(egress_groups, only_routes=changed_routes),
+                egress=egress_payload(egress_groups, only_routes=changed_routes),
                 summary=intent_summary(changes, findings))
     return dict(review=build_review(changes, findings, meta, changed), report=render(changes, meta),
                 findings=findings, changes=changes, n_base=len(base_eps), n_head=len(head_eps),
@@ -967,7 +1059,7 @@ def main():
         res = run_review(repo, base=args.base, head=args.head, merge=args.merge,
                          pr=args.pr, commit=args.commit, invariants_path=args.invariants)
     except RuntimeError as e:
-        sys.exit(f"prism: {e}")
+        sys.exit(f"lenscheck: {e}")
     review, report, findings, changes = res["review"], res["report"], res["findings"], res["changes"]
     if res.get("auto_target"):
         b, h = res["auto_target"]

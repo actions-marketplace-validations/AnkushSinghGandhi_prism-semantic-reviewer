@@ -43,9 +43,13 @@ def ext_dests(ep):
     return out
 
 
+def _open_item(x):
+    return "AllowAny" in x or x.startswith("permission_classes=[]")   # AllowAny or no permission classes
+
+
 def authed(ep):
     e = ep.e2_auth
-    return e.status == "✓" and not any("AllowAny" in x for x in e.items)
+    return e.status == "✓" and not any(_open_item(x) for x in e.items)
 
 
 def auth_label(ep):
@@ -54,6 +58,8 @@ def auth_label(ep):
         return "auth unspecified"
     if any("AllowAny" in x for x in e.items):
         return "open (AllowAny)"
+    if any(x.startswith("permission_classes=[]") for x in e.items):
+        return "open (no permission classes)"
     return "authenticated"
 
 
@@ -516,7 +522,7 @@ def main():
         baseline = json.load(open(args.baseline, encoding="utf-8")) if args.baseline else []
         _, cands = discover(repo, args.snapshots)
         merged = bootstrap_corpus(corpus(cands), baseline)
-        out = args.out if args.out != ap.get_default("out") else "prism-invariants.json"
+        out = args.out if args.out != ap.get_default("out") else "lenscheck-invariants.json"
         json.dump(merged, open(out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
         confirmed = sum(1 for c in merged if c.get("confirmed"))
         frozen = sum(len(c.get("baseline_exceptions", [])) for c in merged)

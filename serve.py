@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Prism live web service — stdlib only, no dependencies.
+Lenscheck live web service — stdlib only, no dependencies.
 
 Local:
     python3 serve.py [--repo <default-repo-or-url>] [--invariants <corpus.json>] [--port 8765]
@@ -8,12 +8,12 @@ Local:
 Deployed (e.g. Render) it reads these env vars:
     PORT                 port to bind (Render sets this)                     [default 8765]
     HOST                 interface to bind                                   [default 0.0.0.0]
-    PRISM_TOKEN          if set, /api/* requires ?token=... (lock down public deploys)
-    PRISM_ALLOWED_REPOS  comma-separated substrings; only matching repos may be reviewed
-    PRISM_BASE_PATH      serve under a sub-path, e.g. /prism (behind a reverse proxy)
+    LENSCHECK_TOKEN          if set, /api/* requires ?token=... (lock down public deploys)
+    LENSCHECK_ALLOWED_REPOS  comma-separated substrings; only matching repos may be reviewed
+    LENSCHECK_BASE_PATH      serve under a sub-path, e.g. /lenscheck (behind a reverse proxy)
     GITHUB_TOKEN         for private repos / GitHub API rate limits
-    PRISM_DEFAULT_REPO   default repo shown in the UI
-    PRISM_INVARIANTS     default invariant corpus path
+    LENSCHECK_DEFAULT_REPO   default repo shown in the UI
+    LENSCHECK_INVARIANTS     default invariant corpus path
 """
 import argparse
 import json
@@ -26,7 +26,8 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import diff_pr           # noqa: E402
 import invariants as inv_mod                          # noqa: E402
-from gitutil import is_url, git_toplevel, ensure_local  # noqa: E402
+from gitutil import (is_url, git_toplevel, ensure_local, sh,   # noqa: E402
+                     current_branch, default_branch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = {}       # (repo, merge, base, head, pr, inv) -> review
@@ -40,6 +41,20 @@ def _discovered(repo, n):
         _, cands = inv_mod.discover(ensure_local(repo), n)
         INV_CACHE[key] = inv_mod.corpus(cands)
     return INV_CACHE[key]
+
+
+def source_snippet(repo, ref, rel, line, ctx=6):
+    """A few source lines around `line` of `rel` at git `ref` (read-only via `git show`, so it works
+    for the exact reviewed snapshot even after temp checkouts are gone). `{found: False}` if missing."""
+    for r in ([ref, "HEAD"] if ref and ref != "HEAD" else ["HEAD"]):     # fall back to HEAD
+        text = sh("git", "-C", repo, "show", f"{r}:{rel}")
+        if text:
+            lines = text.splitlines()
+            start = max(1, line - ctx)
+            end = min(len(lines), line + ctx)
+            return {"found": True, "path": rel, "line": line, "start": start,
+                    "lines": lines[start - 1:end]}
+    return {"found": False, "path": rel, "line": line}
 
 
 def _read_corpus(path):
@@ -56,11 +71,14 @@ def make_handler(cfg):
 
         def _send(self, code, body, ctype):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionError):
+                pass   # client disconnected before we finished (refresh / navigated away) — ignore
 
         def _json(self, code, obj):
             self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
@@ -68,7 +86,7 @@ def make_handler(cfg):
         def _authorized(self, g):
             if not cfg["token"]:
                 return True
-            return (g("token") or self.headers.get("X-Prism-Token")) == cfg["token"]
+            return (g("token") or self.headers.get("X-Lenscheck-Token")) == cfg["token"]
 
         def _repo_ok(self, repo):
             if not cfg["allowed"]:
@@ -85,7 +103,7 @@ def make_handler(cfg):
                 path = path[len(bp):] or "/"
             try:
                 if path in ("/", "/index.html", "/app", "/app.html", ""):
-                    # `prism serve` goes straight to the usage page (the review UI)
+                    # `lenscheck serve` goes straight to the usage page (the review UI)
                     return self._send(200, open(os.path.join(HERE, "web", "app.html"), "rb").read(),
                                       "text/html; charset=utf-8")
                 if path == "/healthz":
@@ -111,9 +129,12 @@ def make_handler(cfg):
                         return self._json(400, {"error": "no repo given"})
                     if not self._repo_ok(repo):
                         return self._json(403, {"error": "repo not in allowlist"})
+                    local = ensure_local(repo)
                     return self._json(200, {"repo": repo,
                                             "branches": diff_pr.list_branches(repo),
-                                            "commits": diff_pr.list_commits(repo, int(g("n", "50")))})
+                                            "commits": diff_pr.list_commits(repo, int(g("n", "50"))),
+                                            "current": current_branch(local),
+                                            "default": default_branch(local)})
                 if path == "/api/review":
                     repo = g("repo") or cfg["repo"]
                     if not self._repo_ok(repo):
@@ -126,6 +147,18 @@ def make_handler(cfg):
                                                  invariants_path=inv)
                         CACHE[key] = res["review"]
                     return self._json(200, CACHE[key])
+                if path == "/api/source":
+                    # source snippet for a flow-graph node: git show <ref>:<path> around a line
+                    repo = g("repo") or cfg["repo"]
+                    if not repo:
+                        return self._json(400, {"error": "no repo given"})
+                    if not self._repo_ok(repo):
+                        return self._json(403, {"error": "repo not in allowlist"})
+                    rel, line = g("path"), int(g("line", "1"))
+                    if not rel:
+                        return self._json(400, {"error": "no path given"})
+                    return self._json(200, source_snippet(ensure_local(repo), g("ref") or "HEAD",
+                                                          rel, line, int(g("ctx", "6"))))
                 if path == "/api/invariants":
                     repo = g("repo") or cfg["repo"]
                     if not repo:
@@ -153,6 +186,8 @@ def make_handler(cfg):
                     return self._json(200, {"repo": repo, "id": inv_id, "result": result,
                                             "text": inv_mod.render_blame(result, inv_id, g("route"))})
                 return self._json(404, {"error": "not found"})
+            except (BrokenPipeError, ConnectionError):
+                return   # client went away mid-request — don't try to write a 500 to a dead socket
             except Exception as e:
                 traceback.print_exc()
                 return self._json(500, {"error": str(e)})
@@ -177,7 +212,7 @@ def make_handler(cfg):
                     corpus_path = cfg["invariants"]
                     if not corpus_path or is_url(corpus_path):
                         return self._json(400, {"error": "confirming needs a local corpus file — "
-                                                "start `prism serve --invariants <path.json>`"})
+                                                "start `lenscheck serve --invariants <path.json>`"})
                     repo = body.get("repo") or cfg["repo"]
                     if not repo:
                         return self._json(400, {"error": "no repo given"})
@@ -197,6 +232,8 @@ def make_handler(cfg):
                                             "confirmed_ids": [c["id"] for c in merged
                                                               if c.get("confirmed")]})
                 return self._json(404, {"error": "not found"})
+            except (BrokenPipeError, ConnectionError):
+                return   # client went away mid-request — don't try to write a 500 to a dead socket
             except Exception as e:
                 traceback.print_exc()
                 return self._json(500, {"error": str(e)})
@@ -208,10 +245,10 @@ def _norm_repo(r):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Prism web UI. Run inside a git repo to auto-select it.")
-    ap.add_argument("--repo", default=os.environ.get("PRISM_DEFAULT_REPO", ""),
+    ap = argparse.ArgumentParser(description="Lenscheck web UI. Run inside a git repo to auto-select it.")
+    ap.add_argument("--repo", default=os.environ.get("LENSCHECK_DEFAULT_REPO", ""),
                     help="repo path or URL (default: the git repo of the current directory)")
-    ap.add_argument("--invariants", default=os.environ.get("PRISM_INVARIANTS", ""))
+    ap.add_argument("--invariants", default=os.environ.get("LENSCHECK_INVARIANTS", ""))
     ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
     # preload a review straight into the UI:
@@ -232,22 +269,22 @@ def main():
     cfg = {
         "repo": _norm_repo(repo),
         "invariants": _norm_repo(args.invariants),
-        "token": os.environ.get("PRISM_TOKEN", ""),
-        "allowed": [s.strip() for s in os.environ.get("PRISM_ALLOWED_REPOS", "").split(",") if s.strip()],
-        "base_path": os.environ.get("PRISM_BASE_PATH", "").rstrip("/"),
+        "token": os.environ.get("LENSCHECK_TOKEN", ""),
+        "allowed": [s.strip() for s in os.environ.get("LENSCHECK_ALLOWED_REPOS", "").split(",") if s.strip()],
+        "base_path": os.environ.get("LENSCHECK_BASE_PATH", "").rstrip("/"),
         "preload": preload,
     }
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(cfg))
     shown = "127.0.0.1" if args.host in ("0.0.0.0", "") else args.host
     url = f"http://{shown}:{args.port}{cfg['base_path'] or ''}/"
-    print(f"Prism  →  {url}")
+    print(f"Lenscheck  →  {url}")
     print(f"  repo: {cfg['repo'] or '(enter one in the UI)'}" + ("  [auto-detected]" if not args.repo and cfg['repo'] else ""))
     if preload:
         print(f"  preloading: {preload}")
     if cfg["token"]:
         print("  access:       token required (?token=…)")
     elif args.host == "0.0.0.0":
-        print("  note: bound on 0.0.0.0 with no PRISM_TOKEN — fine locally, set a token if exposed.")
+        print("  note: bound on 0.0.0.0 with no LENSCHECK_TOKEN — fine locally, set a token if exposed.")
     if cfg["allowed"]:
         print(f"  allowlist:    {cfg['allowed']}")
     if not args.no_open and not os.environ.get("PORT"):   # local run, not a hosted deploy
